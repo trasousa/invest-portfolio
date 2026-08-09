@@ -1,38 +1,42 @@
 import httpx
 from typing import List, Dict, Any
 import logging
-import base64
 
 logger = logging.getLogger(__name__)
 
 class Trading212Service:
     LIVE_URL = "https://live.trading212.com/api/v0"
     DEMO_URL = "https://demo.trading212.com/api/v0"
-    
+
     def __init__(self, api_key: str, api_secret: str = None, is_demo: bool = False):
         # Only strip whitespace, don't remove any characters
         self.api_key = api_key.strip() if api_key else ""
         self.api_secret = api_secret.strip() if api_secret else ""
         self.base_url = self.DEMO_URL if is_demo else self.LIVE_URL
-        
-        # Per Trading 212 docs: ALL endpoints use Basic Auth (API_KEY:API_SECRET)
-        # https://docs.trading212.com/api#section/Authentication
+
+        # The API accepts two schemes (see securitySchemes in api.json):
+        #   authWithSecretKey  - Basic auth, API Key as user / API Secret as password
+        #   legacyApiKeyHeader - the bare API key in the Authorization header
+        # Key-only credentials must fall back to the legacy header, otherwise the
+        # request goes out with no credentials at all and the API answers 401.
         self.auth = (self.api_key, self.api_secret) if self.api_secret else None
-        
+
         self.headers = {
             "User-Agent": "FinNexus/1.0",
             "Accept": "application/json"
         }
-        
+        if not self.api_secret and self.api_key:
+            self.headers["Authorization"] = self.api_key
+
         logger.info(f"Trading212Service initialized: demo={is_demo}, has_secret={bool(self.api_secret)}")
 
     async def validate_connection(self) -> bool:
-        """Check if the API key is valid by fetching account metadata."""
+        """Check if the API key is valid by fetching the account summary."""
         try:
             logger.info(f"Validating Trading212 connection to {self.base_url}")
             async with httpx.AsyncClient(headers=self.headers) as client:
                 response = await client.get(
-                    f"{self.base_url}/equity/account/info",
+                    f"{self.base_url}/equity/account/summary",
                     auth=self.auth,
                     timeout=10.0
                 )
@@ -86,16 +90,21 @@ class Trading212Service:
             return result
 
     async def fetch_cash(self) -> float:
-        """Fetch account cash balance."""
+        """Fetch the cash currently available to trade, in the account currency."""
+        summary = await self.fetch_account_summary()
+        cash = summary.get("cash") or {}
+        return cash.get("availableToTrade", 0.0)
+
+    async def fetch_account_summary(self) -> Dict[str, Any]:
+        """Fetch the account summary (id, currency, cash and investment totals)."""
         async with httpx.AsyncClient(headers=self.headers) as client:
             response = await client.get(
-                f"{self.base_url}/equity/account/cash",
+                f"{self.base_url}/equity/account/summary",
                 auth=self.auth,
                 timeout=10.0
             )
             response.raise_for_status()
-            data = response.json()
-            return data.get("free", 0.0) # Using 'free' cash for investing
+            return response.json()
 
     async def fetch_instrument_metadata(self) -> List[Dict[str, Any]]:
         """Fetch metadata for all instruments."""
@@ -112,7 +121,7 @@ class Trading212Service:
         """Fetch dividend history."""
         async with httpx.AsyncClient(headers=self.headers) as client:
             response = await client.get(
-                f"{self.base_url}/history/dividends?limit={limit}",
+                f"{self.base_url}/equity/history/dividends?limit={limit}",
                 auth=self.auth,
                 timeout=10.0
             )

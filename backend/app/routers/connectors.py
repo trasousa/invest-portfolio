@@ -135,8 +135,28 @@ async def resolve_transaction(
 
 class ConnectRequest(BaseModel):
     api_key: str
-    api_secret: str
+    api_secret: Optional[str] = None
     is_demo: bool = False
+
+
+# The profile endpoint masks stored credentials with bullets. If that mask ever
+# makes it back here it means the client posted the placeholder instead of a real
+# key, which would otherwise be encrypted and stored as the user's credentials.
+_MASK_CHARS = "•*"
+
+
+def _clean_credential(value: Optional[str], field: str) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if all(ch in _MASK_CHARS for ch in cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Please re-enter your {field}; the masked placeholder cannot be used.",
+        )
+    return cleaned
 
 
 class SyncResponse(BaseModel):
@@ -153,11 +173,12 @@ async def connect_trading212(
     db: Session = Depends(get_db),
 ):
     """Save Trading212 API Key and validate connection."""
-    service = Trading212Service(
-        request.api_key.strip(),
-        request.api_secret.strip() if request.api_secret else None,
-        request.is_demo,
-    )
+    api_key = _clean_credential(request.api_key, "API key")
+    api_secret = _clean_credential(request.api_secret, "API secret")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key is required")
+
+    service = Trading212Service(api_key, api_secret, request.is_demo)
 
     try:
         if not await service.validate_connection():
@@ -180,9 +201,12 @@ async def connect_trading212(
     await asyncio.sleep(1)
 
     # Encrypt and save
-    current_user.trading212_api_key = encrypt_string(request.api_key.strip())
-    if request.api_secret:
-        current_user.trading212_api_secret = encrypt_string(request.api_secret.strip())
+    current_user.trading212_api_key = encrypt_string(api_key)
+    # Clear any stale secret when connecting with a key-only credential, otherwise
+    # the next sync would pair the new key with the previous account's secret.
+    current_user.trading212_api_secret = (
+        encrypt_string(api_secret) if api_secret else None
+    )
     current_user.trading212_is_demo = request.is_demo
     db.commit()
 
@@ -194,11 +218,12 @@ async def validate_trading212(
     request: ConnectRequest, current_user: User = Depends(get_current_user)
 ):
     """Validate Trading212 API Key without saving."""
-    service = Trading212Service(
-        request.api_key.strip(),
-        request.api_secret.strip() if request.api_secret else None,
-        request.is_demo,
-    )
+    api_key = _clean_credential(request.api_key, "API key")
+    api_secret = _clean_credential(request.api_secret, "API secret")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key is required")
+
+    service = Trading212Service(api_key, api_secret, request.is_demo)
 
     try:
         if not await service.validate_connection():

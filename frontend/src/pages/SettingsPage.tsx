@@ -40,8 +40,10 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
                 openai_api_key: userProfile.openai_api_key || '',
                 gemini_api_key: userProfile.gemini_api_key || '',
                 ollama_url: userProfile.ollama_url || '',
-                trading212_api_key: userProfile.trading212_api_key || '',
-                trading212_api_secret: userProfile.trading212_api_secret || '',
+                // The profile endpoint returns bullet placeholders, never the real
+                // credentials - keep the inputs empty so we can't post the mask back.
+                trading212_api_key: '',
+                trading212_api_secret: '',
                 trading212_is_demo: userProfile.trading212_is_demo || false
             } as any);
             setTheme(userProfile.theme_preference || 'ocean-dark');
@@ -49,7 +51,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
             const loadData = async () => {
                 try {
                     const res = await axios.get('/api/auth/profile', {
-                        headers: { Authorization: `Bearer ${token} ` }
+                        headers: { Authorization: `Bearer ${token}` }
                     });
                     setProfileData({
                         display_name: res.data.display_name || '',
@@ -58,8 +60,8 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
                         openai_api_key: res.data.openai_api_key || '',
                         gemini_api_key: res.data.gemini_api_key || '',
                         ollama_url: res.data.ollama_url || '',
-                        trading212_api_key: res.data.trading212_api_key || '',
-                        trading212_api_secret: res.data.trading212_api_secret || '',
+                        trading212_api_key: '',
+                        trading212_api_secret: '',
                         trading212_is_demo: res.data.trading212_is_demo || false
                     } as any);
                     setTheme(res.data.theme_preference || 'ocean-dark');
@@ -75,7 +77,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
         e.preventDefault();
         try {
             await axios.put('/api/auth/profile', profileData, {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             await onProfileUpdate();
             alert('Profile updated successfully!');
@@ -89,7 +91,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
         setTheme(newTheme);
         try {
             await axios.put('/api/auth/theme', { theme_preference: newTheme }, {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             await onProfileUpdate();
         } catch (error) {
@@ -100,7 +102,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
     const handleCurrencyChange = async (newCurrency: string) => {
         try {
             await axios.put('/api/auth/profile', { currency: newCurrency }, {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             await onProfileUpdate();
         } catch (error) {
@@ -111,7 +113,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
     const handleTestKey = async (provider: string, key: string) => {
         try {
             await axios.post('/api/auth/test-key', { provider, api_key: key }, {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             alert(`${provider} API Key is valid!`);
         } catch (error: any) {
@@ -124,7 +126,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
         setChatLoading(true);
         try {
             const res = await axios.get('/api/chat/history', {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             setChatHistory(res.data);
         } catch (error) {
@@ -462,7 +464,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
                                     }
                                     try {
                                         const response = await axios.post('/api/connectors/trading212/sync', {}, {
-                                            headers: { Authorization: `Bearer ${token} ` }
+                                            headers: { Authorization: `Bearer ${token}` }
                                         });
                                         alert(`All brokerages synced! Updated ${response.data.positions_updated} positions.`);
                                         window.location.reload();
