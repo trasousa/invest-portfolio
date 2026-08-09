@@ -1,9 +1,11 @@
 # pyright: reportGeneralTypeIssues=false
 
+import asyncio
 import logging
 from collections import defaultdict
+from datetime import datetime
 from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.brokerage.trading212.service import Trading212Service
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.core.security import decrypt_string, encrypt_string
 from app.models.models import (
     Account,
@@ -55,6 +57,12 @@ def _symbol_variations(symbol: Optional[str]) -> List[str]:
         if stripped and stripped != primary:
             variations.append(stripped)
     return variations[:2]
+
+
+# In-flight and most recent sync per user. A sync is a long single-user job that
+# only needs to survive until the client next polls, so it is kept in memory
+# rather than in a table; a restart simply clears it back to "idle".
+_SYNC_JOBS: Dict[int, Dict[str, Any]] = {}
 
 
 POSITION_ACTIONS = [
@@ -309,15 +317,85 @@ async def validate_trading212(
     return {"status": "valid"}
 
 
-@router.post("/trading212/sync", response_model=SyncResponse)
-async def sync_trading212(
-    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
-):
+@router.post("/trading212/sync")
+async def sync_trading212(current_user: User = Depends(get_current_user)):
+    """
+    Start a Trading 212 sync in the background.
+
+    Trading 212 generates the historical report asynchronously and only allows the
+    export listing to be polled once a minute, so a sync can legitimately run for
+    several minutes - far longer than any proxy will hold a request open. The work
+    therefore runs as a background task and the client polls /trading212/sync/status.
+    """
+    if not current_user.trading212_api_key:
+        raise HTTPException(status_code=400, detail="Trading212 not connected")
+
+    job = _SYNC_JOBS.get(current_user.id)
+    if job and job.get("status") == "running":
+        return {"status": "running", "message": "A sync is already in progress"}
+
+    _SYNC_JOBS[current_user.id] = {
+        "status": "running",
+        "message": "Requesting historical report from Trading 212...",
+        "started_at": datetime.utcnow().isoformat(),
+        "result": None,
+    }
+
+    asyncio.create_task(_run_sync_job(current_user.id))
+
+    return {"status": "started", "message": "Sync started"}
+
+
+@router.get("/trading212/sync/status")
+async def get_sync_status(current_user: User = Depends(get_current_user)):
+    """Report the state of this user's most recent sync."""
+    job = _SYNC_JOBS.get(current_user.id)
+    if not job:
+        return {"status": "idle", "message": "", "result": None}
+    return job
+
+
+async def _run_sync_job(user_id: int) -> None:
+    """Run a sync against its own database session and record the outcome."""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            _SYNC_JOBS[user_id] = {
+                "status": "error",
+                "message": "User no longer exists",
+                "result": None,
+            }
+            return
+
+        result = await _perform_sync(user, db)
+        _SYNC_JOBS[user_id] = {
+            "status": "success",
+            "message": result.get("message", "Sync complete"),
+            "result": result,
+        }
+    except HTTPException as e:
+        logger.error(f"❌ Sync failed for user {user_id}: {e.detail}")
+        db.rollback()
+        _SYNC_JOBS[user_id] = {
+            "status": "error",
+            "message": str(e.detail),
+            "result": None,
+        }
+    except Exception as e:
+        logger.error(f"❌ Sync failed for user {user_id}: {e}", exc_info=True)
+        db.rollback()
+        _SYNC_JOBS[user_id] = {"status": "error", "message": str(e), "result": None}
+    finally:
+        db.close()
+
+
+async def _perform_sync(current_user: User, db: Session) -> dict:
     """
     Sync portfolio from Trading212 using CSV historical reports only.
 
-    - First sync: Fetches 7 years of history
-    - Subsequent syncs: Fetches only new data since last sync
+    - First sync: fetches the longest history the API will produce
+    - Subsequent syncs: fetches only new data since last sync
     - Deduplicates transactions using external_id
     - Updates holdings, dividends, and security history
     """
@@ -337,22 +415,18 @@ async def sync_trading212(
     )
     service = Trading212Service(api_key, api_secret, is_demo)
 
+    def _progress(message: str) -> None:
+        """Surface the current stage so the polling client can display it."""
+        job = _SYNC_JOBS.get(current_user.id)
+        if job is not None:
+            job["message"] = message
+
     try:
-        from datetime import datetime, timedelta, date
-        import httpx
-        import asyncio
-        from decimal import Decimal
-        from app.utils.t212_csv_parser import parse_t212_csv
-        from app.models.models import (
-            Transaction,
-            SecurityHistory,
-            Dividend,
-            Security,
-            Account,
-            Holding,
-            TransactionType,
-        )
+        from datetime import timedelta
+
+        from app.models.models import Dividend, Transaction
         from app.utils.isin_resolver import get_ticker_from_isin
+        from app.utils.t212_csv_parser import parse_t212_csv
 
         logger.info("=" * 60)
         logger.info("🚀 Starting Trading 212 Sync")
@@ -386,6 +460,7 @@ async def sync_trading212(
         time_to_str = _fmt(time_to)
 
         logger.info("📥 Requesting historical report...")
+        _progress("Requesting historical report from Trading 212...")
 
         report_id = None
         time_from = time_to - timedelta(days=candidate_windows[0])
@@ -431,6 +506,7 @@ async def sync_trading212(
 
         # Step 4: Parse CSV
         logger.info("📊 Parsing CSV...")
+        _progress("Parsing report...")
         with open(csv_filepath, "r") as f:
             csv_content = f.read()
 
@@ -439,6 +515,7 @@ async def sync_trading212(
 
         # Step 4: Import transactions with deduplication
         logger.info("💾 Importing transactions...")
+        _progress("Importing transactions...")
         new_transactions = 0
         skipped_duplicates = 0
 
@@ -558,6 +635,7 @@ async def sync_trading212(
 
         # Step 5: Update holdings from transactions
         logger.info("📈 Recalculating holdings from transactions...")
+        _progress("Recalculating holdings...")
 
         # Get or create Trading212 account
         account = (
@@ -668,6 +746,7 @@ async def sync_trading212(
 
         # Step 6: Update dividends from DIVIDEND transactions
         logger.info("💰 Processing dividend transactions...")
+        _progress("Processing dividends...")
 
         dividend_transactions = (
             db.query(Transaction)
