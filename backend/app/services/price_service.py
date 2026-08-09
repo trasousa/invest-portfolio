@@ -32,13 +32,55 @@ FRANKFURTER_URL = "https://api.frankfurter.app/latest"
 _PROVIDERS = [YFinanceProvider(), AlphaVantageProvider()]
 
 
+# Some exchanges quote in a minor unit: Yahoo returns London prices as GBp
+# (pence), Tel Aviv as ILA (agorot) and Johannesburg as ZAc (cents). Uppercasing
+# "GBp" turns it into "GBP", so a pence price is treated as pounds and the
+# holding is valued 100x too high; an unrecognised code is worse still, because
+# the lookup fails and falls back to a rate of 1.0.
+_MINOR_UNIT_CURRENCIES = {
+    "GBP": ("GBP", 0.01),  # matched case-sensitively as "GBp"
+    "GBX": ("GBP", 0.01),
+    "ILA": ("ILS", 0.01),
+    "ZAC": ("ZAR", 0.01),
+}
+
+
+def resolve_currency(code: str) -> tuple:
+    """
+    Return (major currency code, factor) for a possibly minor-unit code.
+
+    One unit of the given code equals `factor` units of the major currency, so
+    GBp -> ("GBP", 0.01) and EUR -> ("EUR", 1.0).
+    """
+    raw = (code or "").strip()
+    if not raw:
+        return "USD", 1.0
+
+    # "GBp" is only distinguishable from "GBP" before uppercasing
+    if raw == "GBp":
+        return _MINOR_UNIT_CURRENCIES["GBP"]
+
+    upper = raw.upper()
+    if upper in ("GBX", "ILA", "ZAC"):
+        return _MINOR_UNIT_CURRENCIES[upper]
+
+    return upper, 1.0
+
+
 def get_exchange_rate(from_currency: str, to_currency: str = "USD") -> float:
-    from_currency = from_currency.upper()
-    to_currency = to_currency.upper()
+    from_currency, from_factor = resolve_currency(from_currency)
+    to_currency, to_factor = resolve_currency(to_currency)
+
+    # Converts between the minor and major units on either side (e.g. pence -> pounds)
+    unit_scale = from_factor / to_factor
 
     if from_currency == to_currency:
-        return 1.0
+        return unit_scale
 
+    return _major_unit_rate(from_currency, to_currency) * unit_scale
+
+
+def _major_unit_rate(from_currency: str, to_currency: str) -> float:
     pair_key = f"{from_currency}->{to_currency}"
     cached = EXCHANGE_RATES.get(pair_key)
     if cached and (time.time() - cached["timestamp"] < EXCHANGE_TTL):
