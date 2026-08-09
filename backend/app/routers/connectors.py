@@ -223,9 +223,13 @@ def _clean_credential(value: Optional[str], field: str) -> Optional[str]:
 
 class SyncResponse(BaseModel):
     status: str
+    message: str = ""
     positions_updated: int
     cash_updated: float
     dividends_updated: int
+    transactions_imported: int = 0
+    transactions_skipped: int = 0
+    unresolved_transactions: int = 0
 
 
 @router.post("/trading212/connect")
@@ -709,25 +713,32 @@ async def sync_trading212(
         db.commit()
         logger.info(f"✓ Added {dividends_added} dividend records")
 
-        # Step 7: Update sync timestamp
-        current_user.last_t212_sync_timestamp = datetime.now()
-        current_user.t212_sync_time_from = (
-            time_from
-            if isinstance(time_from, datetime)
-            else datetime.fromisoformat(time_from.replace("Z", ""))
-        )
-        current_user.t212_sync_time_to = (
-            time_to if isinstance(time_to, datetime) else datetime.now()
-        )
-        db.commit()
-        logger.info("✓ Sync timestamp updated")
+        # Step 7: Update sync watermark.
+        # Only advance it when the report actually yielded rows. A report that
+        # parsed to nothing means the export did not really cover the window, and
+        # moving the watermark forward would skip that period permanently - the
+        # next delta sync starts after it and those events are never fetched again.
+        if all_parsed_transactions:
+            current_user.last_t212_sync_timestamp = time_to
+            current_user.t212_sync_time_from = time_from
+            current_user.t212_sync_time_to = time_to
+            db.commit()
+            logger.info("✓ Sync timestamp updated")
+        else:
+            logger.warning(
+                "⚠️ Report contained no transactions - leaving the sync watermark "
+                "untouched so this period is retried on the next sync"
+            )
 
         # Build detailed status message
         status_message = f"Successfully synced {new_transactions} new transactions"
         if skipped_duplicates > 0:
             status_message += f" ({skipped_duplicates} duplicates skipped)"
-        if len(all_parsed_transactions) == 0:
-            status_message = "Sync completed but no transactions found (possibly rate limited or empty period)"
+        if not all_parsed_transactions:
+            status_message = (
+                "Trading 212 returned an empty report for this period. "
+                "Nothing was imported and the next sync will retry the same window."
+            )
 
         logger.info("=" * 60)
         logger.info(f"✅ {status_message}")
@@ -745,6 +756,7 @@ async def sync_trading212(
             "dividends_updated": dividends_added,
             "transactions_imported": new_transactions,
             "transactions_skipped": skipped_duplicates,
+            "unresolved_transactions": unresolved_positions,
         }
 
     except httpx.HTTPStatusError as e:

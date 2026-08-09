@@ -10,8 +10,10 @@ from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
+from app.brokerage.trading212.service import Trading212Service
 from app.models.models import TransactionType
 from app.routers.connectors import replay_positions
 from app.utils.t212_csv_parser import parse_t212_csv
@@ -168,3 +170,122 @@ class TestReplayPositions:
         )
         assert unresolved == 1
         assert list(positions) == ["sec-1"]
+
+
+class TestAuthScheme:
+    def test_key_and_secret_use_basic_auth(self):
+        service = Trading212Service("key", "secret")
+        assert service.auth == ("key", "secret")
+        assert "Authorization" not in service.headers
+
+    def test_key_only_falls_back_to_legacy_header(self):
+        """Without this the request goes out unauthenticated and the API 401s."""
+        service = Trading212Service("key")
+        assert service.auth is None
+        assert service.headers["Authorization"] == "key"
+
+
+class TestReportDownload:
+    """An unusable download must fail loudly rather than write a 0-byte file."""
+
+    @staticmethod
+    def _service_with_response(monkeypatch, response: httpx.Response):
+        service = Trading212Service("key", "secret")
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return response
+
+        monkeypatch.setattr(
+            "app.brokerage.trading212.service.httpx.AsyncClient",
+            lambda *a, **kw: _Client(),
+        )
+        return service
+
+    def _run(self, service):
+        import asyncio
+
+        return asyncio.run(service._download_csv_content("https://example.invalid/report"))
+
+    def test_empty_body_is_rejected(self, monkeypatch):
+        response = httpx.Response(200, content=b"", request=httpx.Request("GET", "https://x"))
+        service = self._service_with_response(monkeypatch, response)
+        with pytest.raises(ValueError, match="empty report"):
+            self._run(service)
+
+    def test_non_csv_body_is_rejected(self, monkeypatch):
+        response = httpx.Response(
+            200, content=b"<html>Access Denied</html>", request=httpx.Request("GET", "https://x")
+        )
+        service = self._service_with_response(monkeypatch, response)
+        with pytest.raises(ValueError, match="not a Trading 212 CSV"):
+            self._run(service)
+
+    def test_valid_csv_is_returned(self, monkeypatch):
+        body = HEADER.encode() + b"\nDeposit,2025-01-01 00:00:00,,,,,D1,,,,,,,10.00,EUR,,,,,,,,\n"
+        response = httpx.Response(200, content=body, request=httpx.Request("GET", "https://x"))
+        service = self._service_with_response(monkeypatch, response)
+        assert self._run(service) == body
+
+
+class TestReportStatus:
+    def test_missing_report_returns_none_instead_of_raising(self, monkeypatch):
+        """A queued report can lag the listing; that must not abort the sync."""
+        import asyncio
+
+        response = httpx.Response(
+            200, json=[{"reportId": 999, "status": "Finished"}],
+            request=httpx.Request("GET", "https://x"),
+        )
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return response
+
+        monkeypatch.setattr(
+            "app.brokerage.trading212.service.httpx.AsyncClient",
+            lambda *a, **kw: _Client(),
+        )
+        service = Trading212Service("key", "secret")
+        assert asyncio.run(service.get_report_status(123)) is None
+
+    def test_report_id_matches_across_string_and_int(self, monkeypatch):
+        import asyncio
+
+        response = httpx.Response(
+            200, json=[{"reportId": 4688535, "status": "Finished"}],
+            request=httpx.Request("GET", "https://x"),
+        )
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return response
+
+        monkeypatch.setattr(
+            "app.brokerage.trading212.service.httpx.AsyncClient",
+            lambda *a, **kw: _Client(),
+        )
+        service = Trading212Service("key", "secret")
+        found = asyncio.run(service.get_report_status("4688535"))
+        assert found["status"] == "Finished"
+
+    def test_poll_interval_respects_documented_rate_limit(self):
+        assert Trading212Service.REPORT_POLL_INTERVAL >= 60
