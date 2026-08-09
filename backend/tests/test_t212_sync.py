@@ -289,3 +289,142 @@ class TestReportStatus:
 
     def test_poll_interval_respects_documented_rate_limit(self):
         assert Trading212Service.REPORT_POLL_INTERVAL >= 60
+
+
+class TestSyncEndToEnd:
+    """
+    Drive a full sync against an in-memory database with the network stubbed out.
+
+    The fixture reproduces the shapes that broke earlier imports: a split whose
+    close and open share a ticker, timestamp and total, dividends with no broker
+    id, and a partial sell.
+    """
+
+    EXPORT = _csv(
+        "Market buy,2025-02-03 10:00:00,US64110L1061,NFLX,Netflix,,EOF100,1.0000000000,100.00,EUR,1.0,,EUR,100.00,EUR,,,,,,,,",
+        "Market buy,2025-02-04 10:00:00,US0378331005,AAPL,Apple,,EOF101,4.0000000000,50.00,EUR,1.0,,EUR,200.00,EUR,,,,,,,,",
+        "Market sell,2025-03-01 10:00:00,US0378331005,AAPL,Apple,,EOF102,2.0000000000,60.00,EUR,1.0,,EUR,120.00,EUR,,,,,,,,",
+        # Split close and open: same ticker, same timestamp, same total
+        "Stock split close,2025-04-01 08:00:00,US64110L1061,NFLX,Netflix,,EOF103,1.0000000000,100.00,EUR,1.0,0.00,EUR,100.00,EUR,,,,,,,,",
+        "Stock split open,2025-04-01 08:00:00,US64110L1061,NFLX,Netflix,,EOF104,10.0000000000,10.00,EUR,1.0,,EUR,100.00,EUR,,,,,,,,",
+        # Dividends carry no broker id
+        "Dividend (Dividend),2025-05-01 10:00:00,US0378331005,AAPL,Apple,,,2.0,0.25,EUR,1.0,,,0.50,EUR,,,,,,,,",
+        "Dividend (Dividend),2025-06-01 10:00:00,US0378331005,AAPL,Apple,,,2.0,0.30,EUR,1.0,,,0.60,EUR,,,,,,,,",
+        "Dividend (Dividend manufactured payment),2025-07-01 10:00:00,US64110L1061,NFLX,Netflix,,,10.0,0.05,EUR,1.0,,,0.50,EUR,,,,,,,,",
+    )
+
+    @pytest.fixture
+    def session(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.core.database import Base
+
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(engine)
+        db = sessionmaker(bind=engine)()
+        yield db
+        db.close()
+
+    @pytest.fixture
+    def user(self, session):
+        from app.core.security import encrypt_string
+        from app.models.models import User
+
+        user = User(
+            email="sync@example.com",
+            hashed_password="x",
+            currency="EUR",
+            trading212_api_key=encrypt_string("key"),
+            trading212_api_secret=encrypt_string("secret"),
+        )
+        session.add(user)
+        session.commit()
+        return user
+
+    def _sync(self, user, session, tmp_path, monkeypatch):
+        import asyncio
+
+        from app.routers import connectors
+
+        export = tmp_path / "export.csv"
+        export.write_text(self.EXPORT)
+
+        async def fake_request(self, *args, **kwargs):
+            return 4688535
+
+        async def fake_download(self, report_id, save_dir):
+            return str(export)
+
+        monkeypatch.setattr(Trading212Service, "request_historical_report", fake_request)
+        monkeypatch.setattr(Trading212Service, "download_report_csv", fake_download)
+        return asyncio.run(connectors._perform_sync(user, session))
+
+    def test_first_sync_imports_everything(self, user, session, tmp_path, monkeypatch):
+        result = self._sync(user, session, tmp_path, monkeypatch)
+        assert result["transactions_imported"] == 8
+        assert result["dividends_updated"] == 3, "id-less dividends must not collapse"
+
+    def test_split_rows_do_not_violate_uniqueness(self, user, session, tmp_path, monkeypatch):
+        """Close and open share ticker/timestamp/total but have distinct ids."""
+        self._sync(user, session, tmp_path, monkeypatch)
+
+        from app.models.models import Holding, Security
+
+        holding = (
+            session.query(Holding)
+            .join(Security, Holding.security_id == Security.id)
+            .filter(Security.symbol == "NFLX")
+            .one()
+        )
+        assert float(holding.quantity) == pytest.approx(10.0)
+        # Basis survives the split: 100 EUR over 10 shares
+        assert float(holding.avg_cost) == pytest.approx(10.0)
+
+    def test_partial_sell_keeps_average_cost(self, user, session, tmp_path, monkeypatch):
+        self._sync(user, session, tmp_path, monkeypatch)
+
+        from app.models.models import Holding, Security
+
+        holding = (
+            session.query(Holding)
+            .join(Security, Holding.security_id == Security.id)
+            .filter(Security.symbol == "AAPL")
+            .one()
+        )
+        assert float(holding.quantity) == pytest.approx(2.0)
+        assert float(holding.avg_cost) == pytest.approx(50.0)
+
+    def test_resync_is_idempotent(self, user, session, tmp_path, monkeypatch):
+        self._sync(user, session, tmp_path, monkeypatch)
+        second = self._sync(user, session, tmp_path, monkeypatch)
+
+        from app.models.models import Dividend, Transaction
+
+        assert second["transactions_imported"] == 0
+        assert second["transactions_skipped"] == 8
+        assert session.query(Transaction).count() == 8
+        assert session.query(Dividend).count() == 3
+
+    def test_empty_report_leaves_watermark_untouched(self, user, session, tmp_path, monkeypatch):
+        import asyncio
+
+        from app.routers import connectors
+
+        empty = tmp_path / "empty.csv"
+        empty.write_text(HEADER + "\n")
+
+        async def fake_request(self, *args, **kwargs):
+            return 1
+
+        async def fake_download(self, report_id, save_dir):
+            return str(empty)
+
+        monkeypatch.setattr(Trading212Service, "request_historical_report", fake_request)
+        monkeypatch.setattr(Trading212Service, "download_report_csv", fake_download)
+
+        result = asyncio.run(connectors._perform_sync(user, session))
+        assert result["transactions_imported"] == 0
+        assert user.last_t212_sync_timestamp is None, (
+            "advancing the watermark on an empty report skips that window forever"
+        )
