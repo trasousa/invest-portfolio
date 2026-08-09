@@ -1,7 +1,9 @@
 # pyright: reportGeneralTypeIssues=false
 
 import logging
-from typing import List, Optional
+from collections import defaultdict
+from decimal import Decimal
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,7 +13,14 @@ from sqlalchemy.orm import Session
 from app.brokerage.trading212.service import Trading212Service
 from app.core.database import get_db
 from app.core.security import decrypt_string, encrypt_string
-from app.models.models import Account, AccountType, Holding, Security, User
+from app.models.models import (
+    Account,
+    AccountType,
+    Holding,
+    Security,
+    TransactionType,
+    User,
+)
 from app.routers.auth import get_current_user
 
 # pyright: reportGeneralTypeIssues=false
@@ -46,6 +55,59 @@ def _symbol_variations(symbol: Optional[str]) -> List[str]:
         if stripped and stripped != primary:
             variations.append(stripped)
     return variations[:2]
+
+
+POSITION_ACTIONS = [
+    TransactionType.BUY,
+    TransactionType.SELL,
+    TransactionType.STOCK_SPLIT_OPEN,
+    TransactionType.STOCK_SPLIT_CLOSE,
+    TransactionType.STOCK_DISTRIBUTION,
+]
+
+
+def replay_positions(transactions) -> Tuple[Dict[str, Dict[str, Decimal]], int]:
+    """
+    Replay position-affecting transactions into share counts and cost basis.
+
+    `transactions` must be ordered by timestamp. Returns a mapping of
+    security_id -> {"shares", "total_cost"} plus the number of transactions that
+    could not be attributed to a security.
+    """
+    positions: Dict[str, Dict[str, Decimal]] = defaultdict(
+        lambda: {"shares": Decimal("0"), "total_cost": Decimal("0")}
+    )
+    unresolved = 0
+
+    for tx in transactions:
+        if not tx.security_id:
+            unresolved += 1
+            continue
+
+        position = positions[tx.security_id]
+        shares = tx.shares or Decimal("0")
+
+        if tx.action_type == TransactionType.BUY:
+            position["shares"] += shares
+            position["total_cost"] += tx.total_amount or Decimal("0")
+        elif tx.action_type == TransactionType.SELL:
+            # Retire cost basis in proportion to the shares leaving the position,
+            # otherwise avg_cost climbs with every partial sale.
+            held = position["shares"]
+            if held > 0:
+                sold_fraction = min(shares / held, Decimal("1"))
+                position["total_cost"] -= position["total_cost"] * sold_fraction
+            position["shares"] -= shares
+        elif tx.action_type == TransactionType.STOCK_SPLIT_CLOSE:
+            # Closes the pre-split position; cost basis carries over untouched.
+            position["shares"] -= shares
+        elif tx.action_type == TransactionType.STOCK_SPLIT_OPEN:
+            position["shares"] += shares
+        elif tx.action_type == TransactionType.STOCK_DISTRIBUTION:
+            # Shares received at no cost, so quantity moves but cost does not.
+            position["shares"] += shares
+
+    return positions, unresolved
 
 
 class ResolveRequest(BaseModel):
@@ -295,49 +357,56 @@ async def sync_trading212(
         # Step 1: Determine date range for CSV report
         logger.info("📅 Determining sync date range...")
 
+        # Report timestamps are UTC ("Z"), so build them from UTC rather than the
+        # server's local clock - otherwise timeTo lands in the future on any host
+        # that is ahead of UTC and the report request is rejected.
+        time_to = datetime.utcnow()
+
         is_first_sync = current_user.last_t212_sync_timestamp is None
         if is_first_sync:
-            # First sync - fetch up to 5 years of history (T212 typically supports this in one report)
-            time_from = datetime.now() - timedelta(days=365 * 5)
-            logger.info(f"   First sync - fetching up to 5 years of history")
+            # Positions opened before the exported window produce impossible
+            # negative share counts, so reach back as far as the API will allow.
+            candidate_windows = [365 * 10, 365 * 5, 365 * 2, 365]
+            logger.info("   First sync - fetching the longest available history")
         else:
             # Subsequent sync - from last sync to now, with 1 day overlap to be safe
-            time_from = current_user.last_t212_sync_timestamp - timedelta(days=1)
-            logger.info(f"   Delta sync - fetching since {time_from}")
-
-        time_to = datetime.now()
-
-        # Step 2: Request report
-        time_from_str = time_from.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        time_to_str = time_to.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-        logger.info(f"📥 Requesting historical report...")
-        logger.info(f"   Period: {time_from.date()} to {time_to.date()}")
-
-        try:
-            # We try to use a wider range for the first sync
-            # T212 API sometimes limits the duration of reports, but 5 years usually works.
-            # If it fails, we catch it.
-            report_id = await service.request_historical_report(
-                time_from_str, time_to_str
+            delta_days = max(
+                (time_to - current_user.last_t212_sync_timestamp).days + 1, 1
             )
-            logger.info(f"   ✓ Report {report_id} requested successfully")
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                logger.error("   ❌ Rate limited - too many recent requests")
-                raise HTTPException(
-                    status_code=429,
-                    detail="Rate limited. Trading 212 allows 1 report request per 30-60 seconds. Please wait and try again.",
-                )
-            if is_first_sync and e.response.status_code == 400:
-                # If 5 years is too long, try 1 year
-                logger.warning("   ⚠️ 5 year report failed, trying 1 year...")
-                time_from = datetime.now() - timedelta(days=365)
-                time_from_str = time_from.isoformat() + "Z"
+            candidate_windows = [delta_days]
+            logger.info(f"   Delta sync - fetching the last {delta_days} day(s)")
+
+        def _fmt(moment: datetime) -> str:
+            return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+        time_to_str = _fmt(time_to)
+
+        logger.info("📥 Requesting historical report...")
+
+        report_id = None
+        time_from = time_to - timedelta(days=candidate_windows[0])
+        for index, window_days in enumerate(candidate_windows):
+            time_from = time_to - timedelta(days=window_days)
+            logger.info(f"   Period: {time_from.date()} to {time_to.date()}")
+            try:
                 report_id = await service.request_historical_report(
-                    time_from_str, time_to_str
+                    _fmt(time_from), time_to_str
                 )
-            else:
+                logger.info(f"   ✓ Report {report_id} requested successfully")
+                break
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    logger.error("   ❌ Rate limited - too many recent requests")
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Rate limited. Trading 212 allows 1 report request per 30-60 seconds. Please wait and try again.",
+                    )
+                is_last_window = index == len(candidate_windows) - 1
+                if e.response.status_code == 400 and not is_last_window:
+                    logger.warning(
+                        f"   ⚠️ {window_days} day report rejected, trying a shorter window..."
+                    )
+                    continue
                 raise
 
         # Step 3: Wait for report to generate and download
@@ -504,45 +573,55 @@ async def sync_trading212(
             db.add(account)
             db.flush()
 
-        # Calculate holdings from all transactions
-        from collections import defaultdict
-        from decimal import Decimal
-
-        holdings_data = defaultdict(
-            lambda: {"shares": Decimal("0"), "total_cost": Decimal("0")}
-        )
-
-        # Get all buy/sell transactions for this user
-        buy_sell_transactions = (
+        # Every action that moves a share count has to be replayed here. Splits in
+        # particular arrive as a close (old share count) plus an open (new share
+        # count) at the same timestamp; ignoring them leaves the position stuck at
+        # the pre-split quantity.
+        position_transactions = (
             db.query(Transaction)
             .filter(
                 Transaction.user_id == current_user.id,
                 Transaction.broker_name == "Trading212",
-                Transaction.action_type.in_(
-                    [TransactionType.BUY, TransactionType.SELL]
-                ),
+                Transaction.action_type.in_(POSITION_ACTIONS),
             )
             .order_by(Transaction.timestamp)
             .all()
         )
 
-        for tx in buy_sell_transactions:
-            if not tx.security_id:
-                continue
+        holdings_data, unresolved_positions = replay_positions(position_transactions)
 
-            if tx.action_type == TransactionType.BUY:
-                holdings_data[tx.security_id]["shares"] += tx.shares or Decimal("0")
-                holdings_data[tx.security_id]["total_cost"] += (
-                    tx.total_amount or Decimal("0")
-                )
-            elif tx.action_type == TransactionType.SELL:
-                holdings_data[tx.security_id]["shares"] -= tx.shares or Decimal("0")
-                # Calculate realized P/L (optional, can add later)
+        if unresolved_positions:
+            logger.warning(
+                f"   ⚠️ {unresolved_positions} position transactions have no matched "
+                "security and are excluded from holdings"
+            )
+
+        # Drop holdings whose transactions no longer add up to a position
+        stale_holdings = (
+            db.query(Holding)
+            .filter(
+                Holding.account_id == account.id,
+                Holding.security_id.notin_(list(holdings_data.keys())),
+            )
+            .delete(synchronize_session=False)
+            if holdings_data
+            else 0
+        )
+        if stale_holdings:
+            logger.info(f"   Removed {stale_holdings} stale holdings")
 
         # Update or create holdings
+        incomplete_history = 0
         for security_id, data in holdings_data.items():
-            if data["shares"] <= 0:
-                # Remove holding if sold all shares
+            if data["shares"] < 0:
+                # A negative share count is impossible in reality - it means the
+                # opening buys fall outside the exported history window. Leave any
+                # existing holding untouched rather than deleting a real position.
+                incomplete_history += 1
+                continue
+
+            if data["shares"] == 0:
+                # Genuinely closed out
                 db.query(Holding).filter(
                     Holding.account_id == account.id, Holding.security_id == security_id
                 ).delete()
@@ -556,11 +635,10 @@ async def sync_trading212(
                 .first()
             )
 
-            avg_cost = (
-                data["total_cost"] / data["shares"]
-                if data["shares"] > 0
-                else Decimal("0")
-            )
+            # Rounding on proportional sell write-downs can push the basis a
+            # fraction below zero; clamp so avg_cost never goes negative.
+            remaining_cost = max(data["total_cost"], Decimal("0"))
+            avg_cost = remaining_cost / data["shares"]
 
             if holding:
                 holding.quantity = float(data["shares"])
@@ -578,6 +656,11 @@ async def sync_trading212(
 
         db.commit()
         logger.info(f"✓ Updated holdings for {len(holdings_data)} securities")
+        if incomplete_history:
+            logger.warning(
+                f"   ⚠️ {incomplete_history} positions have buys older than the exported "
+                "history window; their holdings were left unchanged"
+            )
 
         # Step 6: Update dividends from DIVIDEND transactions
         logger.info("💰 Processing dividend transactions...")
