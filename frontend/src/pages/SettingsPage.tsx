@@ -19,6 +19,44 @@ interface ChatHistoryItem {
     timestamp: string;
 }
 
+interface SyncJobStatus {
+    status: 'idle' | 'running' | 'success' | 'error';
+    message: string;
+    result: { positions_updated: number; transactions_imported: number; dividends_updated: number } | null;
+}
+
+/**
+ * Trading 212 builds the export asynchronously and rate limits status checks to
+ * once a minute, so a sync can run for several minutes. The request only kicks
+ * the job off; the outcome is polled from /sync/status.
+ */
+const SYNC_POLL_INTERVAL_MS = 3000;
+const SYNC_TIMEOUT_MS = 12 * 60 * 1000;
+
+async function pollSyncStatus(
+    token: string,
+    onProgress: (message: string) => void
+): Promise<SyncJobStatus> {
+    const deadline = Date.now() + SYNC_TIMEOUT_MS;
+
+    while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, SYNC_POLL_INTERVAL_MS));
+
+        const { data } = await axios.get<SyncJobStatus>('/api/connectors/trading212/sync/status', {
+            headers: { Authorization: `Bearer ${token}` }
+        });
+
+        if (data.status === 'success' || data.status === 'error') {
+            return data;
+        }
+        if (data.message) {
+            onProgress(data.message);
+        }
+    }
+
+    throw new Error('Sync is taking longer than expected. Check back in a few minutes.');
+}
+
 export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate, userProfile }) => {
     const [theme, setTheme] = useState('ocean-dark');
     const [profileData, setProfileData] = useState<Partial<UserProfile>>({
@@ -40,8 +78,10 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
                 openai_api_key: userProfile.openai_api_key || '',
                 gemini_api_key: userProfile.gemini_api_key || '',
                 ollama_url: userProfile.ollama_url || '',
-                trading212_api_key: userProfile.trading212_api_key || '',
-                trading212_api_secret: userProfile.trading212_api_secret || '',
+                // The profile endpoint returns bullet placeholders, never the real
+                // credentials - keep the inputs empty so we can't post the mask back.
+                trading212_api_key: '',
+                trading212_api_secret: '',
                 trading212_is_demo: userProfile.trading212_is_demo || false
             } as any);
             setTheme(userProfile.theme_preference || 'ocean-dark');
@@ -49,7 +89,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
             const loadData = async () => {
                 try {
                     const res = await axios.get('/api/auth/profile', {
-                        headers: { Authorization: `Bearer ${token} ` }
+                        headers: { Authorization: `Bearer ${token}` }
                     });
                     setProfileData({
                         display_name: res.data.display_name || '',
@@ -58,8 +98,8 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
                         openai_api_key: res.data.openai_api_key || '',
                         gemini_api_key: res.data.gemini_api_key || '',
                         ollama_url: res.data.ollama_url || '',
-                        trading212_api_key: res.data.trading212_api_key || '',
-                        trading212_api_secret: res.data.trading212_api_secret || '',
+                        trading212_api_key: '',
+                        trading212_api_secret: '',
                         trading212_is_demo: res.data.trading212_is_demo || false
                     } as any);
                     setTheme(res.data.theme_preference || 'ocean-dark');
@@ -75,7 +115,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
         e.preventDefault();
         try {
             await axios.put('/api/auth/profile', profileData, {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             await onProfileUpdate();
             alert('Profile updated successfully!');
@@ -89,7 +129,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
         setTheme(newTheme);
         try {
             await axios.put('/api/auth/theme', { theme_preference: newTheme }, {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             await onProfileUpdate();
         } catch (error) {
@@ -100,7 +140,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
     const handleCurrencyChange = async (newCurrency: string) => {
         try {
             await axios.put('/api/auth/profile', { currency: newCurrency }, {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             await onProfileUpdate();
         } catch (error) {
@@ -111,7 +151,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
     const handleTestKey = async (provider: string, key: string) => {
         try {
             await axios.post('/api/auth/test-key', { provider, api_key: key }, {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             alert(`${provider} API Key is valid!`);
         } catch (error: any) {
@@ -124,7 +164,7 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
         setChatLoading(true);
         try {
             const res = await axios.get('/api/chat/history', {
-                headers: { Authorization: `Bearer ${token} ` }
+                headers: { Authorization: `Bearer ${token}` }
             });
             setChatHistory(res.data);
         } catch (error) {
@@ -460,15 +500,23 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
                                         alert('No brokerages connected to sync');
                                         return;
                                     }
+                                    setIsSyncing(true);
+                                    setSyncStatus('Starting sync...');
                                     try {
-                                        const response = await axios.post('/api/connectors/trading212/sync', {}, {
-                                            headers: { Authorization: `Bearer ${token} ` }
+                                        await axios.post('/api/connectors/trading212/sync', {}, {
+                                            headers: { Authorization: `Bearer ${token}` }
                                         });
-                                        alert(`All brokerages synced! Updated ${response.data.positions_updated} positions.`);
+                                        const job = await pollSyncStatus(token, setSyncStatus);
+                                        if (job.status === 'error') {
+                                            throw new Error(job.message);
+                                        }
+                                        alert(`All brokerages synced! Updated ${job.result?.positions_updated ?? 0} positions.`);
                                         window.location.reload();
                                     } catch (error: any) {
                                         console.error('Sync failed:', error);
-                                        alert(`Sync failed: ${error.response?.data?.detail || error.message} `);
+                                        setSyncStatus('');
+                                        setIsSyncing(false);
+                                        alert(`Sync failed: ${error.response?.data?.detail || error.message}`);
                                     }
                                 }}
                                 className="btn btn-sm btn-primary flex items-center gap-2"
@@ -662,15 +710,19 @@ export const SettingsPage: React.FC<Props> = ({ token, onLogout, onProfileUpdate
                             <button
                                 onClick={async () => {
                                     setIsSyncing(true);
-                                    setSyncStatus('Syncing positions...');
+                                    setSyncStatus('Starting sync...');
                                     try {
-                                        const response = await axios.post('/api/connectors/trading212/sync', {}, {
+                                        await axios.post('/api/connectors/trading212/sync', {}, {
                                             headers: { Authorization: `Bearer ${token}` }
                                         });
-                                        setSyncStatus('✓ Sync complete!');
+                                        const job = await pollSyncStatus(token, setSyncStatus);
+                                        if (job.status === 'error') {
+                                            throw new Error(job.message);
+                                        }
+                                        setSyncStatus(`✓ ${job.message || 'Sync complete!'}`);
                                         setTimeout(() => {
                                             window.location.reload();
-                                        }, 1000);
+                                        }, 1500);
                                     } catch (error: any) {
                                         console.error('Sync failed:', error);
                                         setSyncStatus('');

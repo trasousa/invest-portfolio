@@ -1,38 +1,45 @@
 import httpx
 from typing import List, Dict, Any
 import logging
-import base64
 
 logger = logging.getLogger(__name__)
 
 class Trading212Service:
     LIVE_URL = "https://live.trading212.com/api/v0"
     DEMO_URL = "https://demo.trading212.com/api/v0"
-    
+
+    # Documented rate limit for GET /equity/history/exports
+    REPORT_POLL_INTERVAL = 60
+
     def __init__(self, api_key: str, api_secret: str = None, is_demo: bool = False):
         # Only strip whitespace, don't remove any characters
         self.api_key = api_key.strip() if api_key else ""
         self.api_secret = api_secret.strip() if api_secret else ""
         self.base_url = self.DEMO_URL if is_demo else self.LIVE_URL
-        
-        # Per Trading 212 docs: ALL endpoints use Basic Auth (API_KEY:API_SECRET)
-        # https://docs.trading212.com/api#section/Authentication
+
+        # The API accepts two schemes (see securitySchemes in api.json):
+        #   authWithSecretKey  - Basic auth, API Key as user / API Secret as password
+        #   legacyApiKeyHeader - the bare API key in the Authorization header
+        # Key-only credentials must fall back to the legacy header, otherwise the
+        # request goes out with no credentials at all and the API answers 401.
         self.auth = (self.api_key, self.api_secret) if self.api_secret else None
-        
+
         self.headers = {
             "User-Agent": "FinNexus/1.0",
             "Accept": "application/json"
         }
-        
+        if not self.api_secret and self.api_key:
+            self.headers["Authorization"] = self.api_key
+
         logger.info(f"Trading212Service initialized: demo={is_demo}, has_secret={bool(self.api_secret)}")
 
     async def validate_connection(self) -> bool:
-        """Check if the API key is valid by fetching account metadata."""
+        """Check if the API key is valid by fetching the account summary."""
         try:
             logger.info(f"Validating Trading212 connection to {self.base_url}")
             async with httpx.AsyncClient(headers=self.headers) as client:
                 response = await client.get(
-                    f"{self.base_url}/equity/account/info",
+                    f"{self.base_url}/equity/account/summary",
                     auth=self.auth,
                     timeout=10.0
                 )
@@ -86,16 +93,21 @@ class Trading212Service:
             return result
 
     async def fetch_cash(self) -> float:
-        """Fetch account cash balance."""
+        """Fetch the cash currently available to trade, in the account currency."""
+        summary = await self.fetch_account_summary()
+        cash = summary.get("cash") or {}
+        return cash.get("availableToTrade", 0.0)
+
+    async def fetch_account_summary(self) -> Dict[str, Any]:
+        """Fetch the account summary (id, currency, cash and investment totals)."""
         async with httpx.AsyncClient(headers=self.headers) as client:
             response = await client.get(
-                f"{self.base_url}/equity/account/cash",
+                f"{self.base_url}/equity/account/summary",
                 auth=self.auth,
                 timeout=10.0
             )
             response.raise_for_status()
-            data = response.json()
-            return data.get("free", 0.0) # Using 'free' cash for investing
+            return response.json()
 
     async def fetch_instrument_metadata(self) -> List[Dict[str, Any]]:
         """Fetch metadata for all instruments."""
@@ -112,7 +124,7 @@ class Trading212Service:
         """Fetch dividend history."""
         async with httpx.AsyncClient(headers=self.headers) as client:
             response = await client.get(
-                f"{self.base_url}/history/dividends?limit={limit}",
+                f"{self.base_url}/equity/history/dividends?limit={limit}",
                 auth=self.auth,
                 timeout=10.0
             )
@@ -177,9 +189,10 @@ class Trading212Service:
     async def get_report_status(self, report_id: str = None) -> Dict[str, Any]:
         """
         Get status of reports.
-        
-        If report_id is provided, get specific report from list.
-        Otherwise returns list of all reports.
+
+        If report_id is provided, return that report from the list, or None while
+        it has not appeared yet (a freshly queued report can lag the listing).
+        Otherwise returns the list of all reports.
         """
         async with httpx.AsyncClient(headers=self.headers) as client:
             # Get all reports
@@ -188,17 +201,17 @@ class Trading212Service:
                 auth=self.auth,
                 timeout=10.0
             )
-            
+
             response.raise_for_status()
             reports = response.json()
-            
+
             if report_id:
-                # Find specific report in list
+                # reportId is an int64 in the API but may arrive as a string
                 for report in reports:
-                    if report.get("reportId") == report_id:
+                    if str(report.get("reportId")) == str(report_id):
                         return report
-                raise ValueError(f"Report {report_id} not found")
-            
+                return None
+
             return reports
 
 
@@ -216,62 +229,83 @@ class Trading212Service:
         """
         import os
         import asyncio
-        
-        # Poll for report completion
-        # Trading 212 rate limit: 1 GET request per 60 seconds
-        # Poll every 30 seconds, max 4 attempts (2 minutes total)
-        max_attempts = 4
-        poll_interval = 30  # seconds
-        
+
+        # GET /equity/history/exports is limited to 1 request per 60 seconds.
+        # Polling faster than that just burns an attempt on a guaranteed 429.
+        max_attempts = 8
+        poll_interval = self.REPORT_POLL_INTERVAL
+
         for attempt in range(max_attempts):
             # Wait before polling (except first attempt)
             if attempt > 0:
                 logger.info(f"   Waiting {poll_interval} seconds before next status check...")
                 await asyncio.sleep(poll_interval)
-            
+
             try:
                 status_data = await self.get_report_status(report_id)
-                status = status_data.get("status")
-                
-                logger.info(f"   Report status: {status} (attempt {attempt + 1}/{max_attempts})")
-                
-                if status == "Finished":
-                    download_link = status_data.get("downloadLink")
-                    if not download_link:
-                        raise ValueError("Download link not provided in completed report")
-                    
-                    # Download the CSV from S3 (presigned URL - no auth needed)
-                    async with httpx.AsyncClient(headers=self.headers) as client:
-                        csv_response = await client.get(
-                            download_link,
-                            # S3 presigned URLs include auth in query params, don't add headers
-                            timeout=30.0
-                        )
-                        csv_response.raise_for_status()
-                        
-                        # Save to file
-                        os.makedirs(save_dir, exist_ok=True)
-                        from datetime import datetime
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        filename = f"trading212_events_{timestamp}.csv"
-                        filepath = os.path.join(save_dir, filename)
-                        
-                        with open(filepath, 'wb') as f:
-                            f.write(csv_response.content)
-                        
-                        logger.info(f"   Downloaded report to {filepath}")
-                        return filepath
-                
-                elif status == "Failed":
-                    raise ValueError(f"Report generation failed for {report_id}")
-                
-                # Still generating (status="Processing"), continue polling
-                
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 429:
                     logger.warning(f"   Rate limited when checking status (attempt {attempt + 1})")
-                    # Continue to next attempt after waiting
                     continue
                 raise
-        
-        raise TimeoutError(f"Report {report_id} did not complete within {max_attempts * poll_interval} seconds")
+
+            if status_data is None:
+                logger.info(f"   Report {report_id} not listed yet (attempt {attempt + 1}/{max_attempts})")
+                continue
+
+            status = status_data.get("status")
+            logger.info(f"   Report status: {status} (attempt {attempt + 1}/{max_attempts})")
+
+            if status == "Finished":
+                download_link = status_data.get("downloadLink")
+                if not download_link:
+                    raise ValueError("Download link not provided in completed report")
+
+                content = await self._download_csv_content(download_link)
+
+                # Save to file
+                os.makedirs(save_dir, exist_ok=True)
+                from datetime import datetime
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f"trading212_events_{timestamp}.csv"
+                filepath = os.path.join(save_dir, filename)
+
+                with open(filepath, 'wb') as f:
+                    f.write(content)
+
+                logger.info(f"   Downloaded report to {filepath} ({len(content)} bytes)")
+                return filepath
+
+            if status in ("Failed", "Canceled"):
+                raise ValueError(f"Report generation {status.lower()} for {report_id}")
+
+            # Queued / Processing / Running - keep polling
+
+        raise TimeoutError(
+            f"Report {report_id} did not complete within {max_attempts * poll_interval} seconds"
+        )
+
+    async def _download_csv_content(self, download_link: str) -> bytes:
+        """
+        Fetch the generated CSV and verify it actually contains a report.
+
+        The download is a presigned link, so it carries its own credentials in the
+        query string and must not inherit our Authorization header. An empty or
+        header-less body means the export did not really succeed; accepting it
+        silently writes a 0-byte file and imports zero transactions.
+        """
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(download_link, timeout=60.0)
+            response.raise_for_status()
+            content = response.content
+
+        if not content.strip():
+            raise ValueError("Trading 212 returned an empty report file")
+
+        first_line = content.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+        if "Action" not in first_line:
+            raise ValueError(
+                f"Downloaded report is not a Trading 212 CSV export (first line: {first_line[:80]!r})"
+            )
+
+        return content

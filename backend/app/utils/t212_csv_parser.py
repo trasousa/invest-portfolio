@@ -15,6 +15,7 @@ Handles all transaction types:
 """
 
 import csv
+import hashlib
 from datetime import datetime
 from decimal import Decimal
 from typing import List, Dict, Any, Optional
@@ -26,12 +27,20 @@ logger = logging.getLogger(__name__)
 
 class T212CSVParser:
     """Parser for Trading 212 CSV export files."""
-    
-    # Map Trading 212 'Action' values to our TransactionType enum
+
+    # Map Trading 212 'Action' values to our TransactionType enum.
+    # Trading 212 emits one row per order type, so limit/stop orders have to be
+    # mapped alongside market orders - otherwise those trades are dropped and
+    # every holding they touch ends up with the wrong share count.
     ACTION_TYPE_MAP = {
         "Market buy": "buy",
+        "Limit buy": "buy",
+        "Stop buy": "buy",
+        "Stop limit buy": "buy",
         "Market sell": "sell",
-        "Dividend (Dividend)": "dividend",
+        "Limit sell": "sell",
+        "Stop sell": "sell",
+        "Stop limit sell": "sell",
         "Deposit": "deposit",
         "Withdrawal": "withdrawal",
         "Interest on cash": "interest",
@@ -40,7 +49,26 @@ class T212CSVParser:
         "Stock split close": "stock_split_close",
         "Stock distribution": "stock_distribution",
     }
-    
+
+    # Timestamp formats seen across Trading 212 exports.
+    TIME_FORMATS = ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d")
+
+    @staticmethod
+    def _map_action(action: str) -> Optional[str]:
+        """
+        Resolve a CSV 'Action' value to a TransactionType value.
+
+        Dividends arrive as a family of labels - "Dividend (Dividend)",
+        "Dividend (Dividend manufactured payment)", "Dividend (Bonus)" and so on -
+        so they are matched by prefix rather than enumerated one by one.
+        """
+        mapped = T212CSVParser.ACTION_TYPE_MAP.get(action)
+        if mapped:
+            return mapped
+        if action.startswith("Dividend"):
+            return "dividend"
+        return None
+
     @staticmethod
     def parse_csv(csv_content: str) -> List[Dict[str, Any]]:
         """
@@ -81,19 +109,19 @@ class T212CSVParser:
             return None
         
         # Map action to transaction type
-        action_type = T212CSVParser.ACTION_TYPE_MAP.get(action)
+        action_type = T212CSVParser._map_action(action)
         if not action_type:
             logger.warning(f"Unknown action type: {action}")
             return None
-        
+
         # Parse timestamp
         time_str = row.get("Time", "").strip()
-        timestamp = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S") if time_str else None
-        
+        timestamp = T212CSVParser._parse_timestamp(time_str)
+
         # Extract common fields
         transaction = {
             # Identification
-            "external_id": row.get("ID", "").strip() or None,
+            "external_id": T212CSVParser._external_id(row),
             "broker_name": "Trading212",
             "action_type": action_type,
             "timestamp": timestamp,
@@ -112,9 +140,9 @@ class T212CSVParser:
             "total_amount": T212CSVParser._parse_decimal(row.get("Total")) or Decimal("0"),
             "total_currency": row.get("Currency (Total)", "EUR").strip(),
             
-            # Conversion and fees
+            # Conversion and fees ('fees' is the total of every charge on the row)
             "exchange_rate": T212CSVParser._parse_decimal(row.get("Exchange rate")),
-            "fees": T212CSVParser._parse_decimal(row.get("Currency conversion fee")) or Decimal("0"),
+            "fees": T212CSVParser._total_fees(row),
             "currency_conversion_fee": T212CSVParser._parse_decimal(row.get("Currency conversion fee")) or Decimal("0"),
             "withholding_tax": T212CSVParser._parse_decimal(row.get("Withholding tax")) or Decimal("0"),
             "withholding_tax_currency": row.get("Currency (Withholding tax)", "").strip() or None,
@@ -131,6 +159,64 @@ class T212CSVParser:
         
         return transaction
     
+    @staticmethod
+    def _parse_timestamp(time_str: str) -> Optional[datetime]:
+        """Parse a CSV 'Time' value, tolerating optional fractional seconds."""
+        if not time_str:
+            return None
+        for fmt in T212CSVParser.TIME_FORMATS:
+            try:
+                return datetime.strptime(time_str, fmt)
+            except ValueError:
+                continue
+        raise ValueError(f"Unrecognised timestamp format: {time_str!r}")
+
+    @staticmethod
+    def _external_id(row: Dict[str, str]) -> str:
+        """
+        Return a stable per-transaction identifier.
+
+        Trading 212 leaves the ID column empty on dividend rows. A null id makes
+        the importer's `external_id == None` lookup match *every* previously
+        imported id-less row, so all but the first dividend would be discarded as
+        duplicates. Derive a deterministic fingerprint from the row's content
+        instead: it is stable across re-exports, so re-syncing the same period
+        still deduplicates correctly.
+        """
+        provided = (row.get("ID") or "").strip()
+        if provided:
+            return provided
+
+        fingerprint = "|".join(
+            (row.get(field) or "").strip()
+            for field in (
+                "Action",
+                "Time",
+                "ISIN",
+                "Ticker",
+                "No. of shares",
+                "Price / share",
+                "Total",
+                "Currency (Total)",
+            )
+        )
+        digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:24]
+        return f"t212-{digest}"
+
+    @staticmethod
+    def _total_fees(row: Dict[str, str]) -> Decimal:
+        """Sum every fee/tax column present on the row."""
+        total = Decimal("0")
+        for field in (
+            "Currency conversion fee",
+            "Stamp duty reserve tax",
+            "French transaction tax",
+            "Transaction fee",
+            "Finra fee",
+        ):
+            total += T212CSVParser._parse_decimal(row.get(field)) or Decimal("0")
+        return total
+
     @staticmethod
     def _parse_decimal(value: Optional[str]) -> Optional[Decimal]:
         """Parse a string value to Decimal, handling empty/invalid values."""

@@ -163,7 +163,7 @@ export const DiversificationPage: React.FC<Props> = ({ token, holdings, filterTy
         const fetchData = async () => {
             try {
                 const res = await axios.get('/api/portfolio/diversification', {
-                    headers: { Authorization: `Bearer ${token} ` }
+                    headers: { Authorization: `Bearer ${token}` }
                 });
                 setData(res.data);
             } catch (error) {

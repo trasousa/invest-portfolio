@@ -1,7 +1,11 @@
 # pyright: reportGeneralTypeIssues=false
 
+import asyncio
 import logging
-from typing import List, Optional
+from collections import defaultdict
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,9 +13,16 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.brokerage.trading212.service import Trading212Service
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.core.security import decrypt_string, encrypt_string
-from app.models.models import Account, AccountType, Holding, Security, User
+from app.models.models import (
+    Account,
+    AccountType,
+    Holding,
+    Security,
+    TransactionType,
+    User,
+)
 from app.routers.auth import get_current_user
 
 # pyright: reportGeneralTypeIssues=false
@@ -46,6 +57,65 @@ def _symbol_variations(symbol: Optional[str]) -> List[str]:
         if stripped and stripped != primary:
             variations.append(stripped)
     return variations[:2]
+
+
+# In-flight and most recent sync per user. A sync is a long single-user job that
+# only needs to survive until the client next polls, so it is kept in memory
+# rather than in a table; a restart simply clears it back to "idle".
+_SYNC_JOBS: Dict[int, Dict[str, Any]] = {}
+
+
+POSITION_ACTIONS = [
+    TransactionType.BUY,
+    TransactionType.SELL,
+    TransactionType.STOCK_SPLIT_OPEN,
+    TransactionType.STOCK_SPLIT_CLOSE,
+    TransactionType.STOCK_DISTRIBUTION,
+]
+
+
+def replay_positions(transactions) -> Tuple[Dict[str, Dict[str, Decimal]], int]:
+    """
+    Replay position-affecting transactions into share counts and cost basis.
+
+    `transactions` must be ordered by timestamp. Returns a mapping of
+    security_id -> {"shares", "total_cost"} plus the number of transactions that
+    could not be attributed to a security.
+    """
+    positions: Dict[str, Dict[str, Decimal]] = defaultdict(
+        lambda: {"shares": Decimal("0"), "total_cost": Decimal("0")}
+    )
+    unresolved = 0
+
+    for tx in transactions:
+        if not tx.security_id:
+            unresolved += 1
+            continue
+
+        position = positions[tx.security_id]
+        shares = tx.shares or Decimal("0")
+
+        if tx.action_type == TransactionType.BUY:
+            position["shares"] += shares
+            position["total_cost"] += tx.total_amount or Decimal("0")
+        elif tx.action_type == TransactionType.SELL:
+            # Retire cost basis in proportion to the shares leaving the position,
+            # otherwise avg_cost climbs with every partial sale.
+            held = position["shares"]
+            if held > 0:
+                sold_fraction = min(shares / held, Decimal("1"))
+                position["total_cost"] -= position["total_cost"] * sold_fraction
+            position["shares"] -= shares
+        elif tx.action_type == TransactionType.STOCK_SPLIT_CLOSE:
+            # Closes the pre-split position; cost basis carries over untouched.
+            position["shares"] -= shares
+        elif tx.action_type == TransactionType.STOCK_SPLIT_OPEN:
+            position["shares"] += shares
+        elif tx.action_type == TransactionType.STOCK_DISTRIBUTION:
+            # Shares received at no cost, so quantity moves but cost does not.
+            position["shares"] += shares
+
+    return positions, unresolved
 
 
 class ResolveRequest(BaseModel):
@@ -135,15 +205,39 @@ async def resolve_transaction(
 
 class ConnectRequest(BaseModel):
     api_key: str
-    api_secret: str
+    api_secret: Optional[str] = None
     is_demo: bool = False
+
+
+# The profile endpoint masks stored credentials with bullets. If that mask ever
+# makes it back here it means the client posted the placeholder instead of a real
+# key, which would otherwise be encrypted and stored as the user's credentials.
+_MASK_CHARS = "•*"
+
+
+def _clean_credential(value: Optional[str], field: str) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if all(ch in _MASK_CHARS for ch in cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Please re-enter your {field}; the masked placeholder cannot be used.",
+        )
+    return cleaned
 
 
 class SyncResponse(BaseModel):
     status: str
+    message: str = ""
     positions_updated: int
     cash_updated: float
     dividends_updated: int
+    transactions_imported: int = 0
+    transactions_skipped: int = 0
+    unresolved_transactions: int = 0
 
 
 @router.post("/trading212/connect")
@@ -153,11 +247,12 @@ async def connect_trading212(
     db: Session = Depends(get_db),
 ):
     """Save Trading212 API Key and validate connection."""
-    service = Trading212Service(
-        request.api_key.strip(),
-        request.api_secret.strip() if request.api_secret else None,
-        request.is_demo,
-    )
+    api_key = _clean_credential(request.api_key, "API key")
+    api_secret = _clean_credential(request.api_secret, "API secret")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key is required")
+
+    service = Trading212Service(api_key, api_secret, request.is_demo)
 
     try:
         if not await service.validate_connection():
@@ -180,9 +275,12 @@ async def connect_trading212(
     await asyncio.sleep(1)
 
     # Encrypt and save
-    current_user.trading212_api_key = encrypt_string(request.api_key.strip())
-    if request.api_secret:
-        current_user.trading212_api_secret = encrypt_string(request.api_secret.strip())
+    current_user.trading212_api_key = encrypt_string(api_key)
+    # Clear any stale secret when connecting with a key-only credential, otherwise
+    # the next sync would pair the new key with the previous account's secret.
+    current_user.trading212_api_secret = (
+        encrypt_string(api_secret) if api_secret else None
+    )
     current_user.trading212_is_demo = request.is_demo
     db.commit()
 
@@ -194,11 +292,12 @@ async def validate_trading212(
     request: ConnectRequest, current_user: User = Depends(get_current_user)
 ):
     """Validate Trading212 API Key without saving."""
-    service = Trading212Service(
-        request.api_key.strip(),
-        request.api_secret.strip() if request.api_secret else None,
-        request.is_demo,
-    )
+    api_key = _clean_credential(request.api_key, "API key")
+    api_secret = _clean_credential(request.api_secret, "API secret")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key is required")
+
+    service = Trading212Service(api_key, api_secret, request.is_demo)
 
     try:
         if not await service.validate_connection():
@@ -218,15 +317,85 @@ async def validate_trading212(
     return {"status": "valid"}
 
 
-@router.post("/trading212/sync", response_model=SyncResponse)
-async def sync_trading212(
-    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
-):
+@router.post("/trading212/sync")
+async def sync_trading212(current_user: User = Depends(get_current_user)):
+    """
+    Start a Trading 212 sync in the background.
+
+    Trading 212 generates the historical report asynchronously and only allows the
+    export listing to be polled once a minute, so a sync can legitimately run for
+    several minutes - far longer than any proxy will hold a request open. The work
+    therefore runs as a background task and the client polls /trading212/sync/status.
+    """
+    if not current_user.trading212_api_key:
+        raise HTTPException(status_code=400, detail="Trading212 not connected")
+
+    job = _SYNC_JOBS.get(current_user.id)
+    if job and job.get("status") == "running":
+        return {"status": "running", "message": "A sync is already in progress"}
+
+    _SYNC_JOBS[current_user.id] = {
+        "status": "running",
+        "message": "Requesting historical report from Trading 212...",
+        "started_at": datetime.utcnow().isoformat(),
+        "result": None,
+    }
+
+    asyncio.create_task(_run_sync_job(current_user.id))
+
+    return {"status": "started", "message": "Sync started"}
+
+
+@router.get("/trading212/sync/status")
+async def get_sync_status(current_user: User = Depends(get_current_user)):
+    """Report the state of this user's most recent sync."""
+    job = _SYNC_JOBS.get(current_user.id)
+    if not job:
+        return {"status": "idle", "message": "", "result": None}
+    return job
+
+
+async def _run_sync_job(user_id: int) -> None:
+    """Run a sync against its own database session and record the outcome."""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            _SYNC_JOBS[user_id] = {
+                "status": "error",
+                "message": "User no longer exists",
+                "result": None,
+            }
+            return
+
+        result = await _perform_sync(user, db)
+        _SYNC_JOBS[user_id] = {
+            "status": "success",
+            "message": result.get("message", "Sync complete"),
+            "result": result,
+        }
+    except HTTPException as e:
+        logger.error(f"❌ Sync failed for user {user_id}: {e.detail}")
+        db.rollback()
+        _SYNC_JOBS[user_id] = {
+            "status": "error",
+            "message": str(e.detail),
+            "result": None,
+        }
+    except Exception as e:
+        logger.error(f"❌ Sync failed for user {user_id}: {e}", exc_info=True)
+        db.rollback()
+        _SYNC_JOBS[user_id] = {"status": "error", "message": str(e), "result": None}
+    finally:
+        db.close()
+
+
+async def _perform_sync(current_user: User, db: Session) -> dict:
     """
     Sync portfolio from Trading212 using CSV historical reports only.
 
-    - First sync: Fetches 7 years of history
-    - Subsequent syncs: Fetches only new data since last sync
+    - First sync: fetches the longest history the API will produce
+    - Subsequent syncs: fetches only new data since last sync
     - Deduplicates transactions using external_id
     - Updates holdings, dividends, and security history
     """
@@ -246,22 +415,18 @@ async def sync_trading212(
     )
     service = Trading212Service(api_key, api_secret, is_demo)
 
+    def _progress(message: str) -> None:
+        """Surface the current stage so the polling client can display it."""
+        job = _SYNC_JOBS.get(current_user.id)
+        if job is not None:
+            job["message"] = message
+
     try:
-        from datetime import datetime, timedelta, date
-        import httpx
-        import asyncio
-        from decimal import Decimal
-        from app.utils.t212_csv_parser import parse_t212_csv
-        from app.models.models import (
-            Transaction,
-            SecurityHistory,
-            Dividend,
-            Security,
-            Account,
-            Holding,
-            TransactionType,
-        )
+        from datetime import timedelta
+
+        from app.models.models import Dividend, Transaction
         from app.utils.isin_resolver import get_ticker_from_isin
+        from app.utils.t212_csv_parser import parse_t212_csv
 
         logger.info("=" * 60)
         logger.info("🚀 Starting Trading 212 Sync")
@@ -270,49 +435,57 @@ async def sync_trading212(
         # Step 1: Determine date range for CSV report
         logger.info("📅 Determining sync date range...")
 
+        # Report timestamps are UTC ("Z"), so build them from UTC rather than the
+        # server's local clock - otherwise timeTo lands in the future on any host
+        # that is ahead of UTC and the report request is rejected.
+        time_to = datetime.utcnow()
+
         is_first_sync = current_user.last_t212_sync_timestamp is None
         if is_first_sync:
-            # First sync - fetch up to 5 years of history (T212 typically supports this in one report)
-            time_from = datetime.now() - timedelta(days=365 * 5)
-            logger.info(f"   First sync - fetching up to 5 years of history")
+            # Positions opened before the exported window produce impossible
+            # negative share counts, so reach back as far as the API will allow.
+            candidate_windows = [365 * 10, 365 * 5, 365 * 2, 365]
+            logger.info("   First sync - fetching the longest available history")
         else:
             # Subsequent sync - from last sync to now, with 1 day overlap to be safe
-            time_from = current_user.last_t212_sync_timestamp - timedelta(days=1)
-            logger.info(f"   Delta sync - fetching since {time_from}")
-
-        time_to = datetime.now()
-
-        # Step 2: Request report
-        time_from_str = time_from.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        time_to_str = time_to.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-        logger.info(f"📥 Requesting historical report...")
-        logger.info(f"   Period: {time_from.date()} to {time_to.date()}")
-
-        try:
-            # We try to use a wider range for the first sync
-            # T212 API sometimes limits the duration of reports, but 5 years usually works.
-            # If it fails, we catch it.
-            report_id = await service.request_historical_report(
-                time_from_str, time_to_str
+            delta_days = max(
+                (time_to - current_user.last_t212_sync_timestamp).days + 1, 1
             )
-            logger.info(f"   ✓ Report {report_id} requested successfully")
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                logger.error("   ❌ Rate limited - too many recent requests")
-                raise HTTPException(
-                    status_code=429,
-                    detail="Rate limited. Trading 212 allows 1 report request per 30-60 seconds. Please wait and try again.",
-                )
-            if is_first_sync and e.response.status_code == 400:
-                # If 5 years is too long, try 1 year
-                logger.warning("   ⚠️ 5 year report failed, trying 1 year...")
-                time_from = datetime.now() - timedelta(days=365)
-                time_from_str = time_from.isoformat() + "Z"
+            candidate_windows = [delta_days]
+            logger.info(f"   Delta sync - fetching the last {delta_days} day(s)")
+
+        def _fmt(moment: datetime) -> str:
+            return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+        time_to_str = _fmt(time_to)
+
+        logger.info("📥 Requesting historical report...")
+        _progress("Requesting historical report from Trading 212...")
+
+        report_id = None
+        time_from = time_to - timedelta(days=candidate_windows[0])
+        for index, window_days in enumerate(candidate_windows):
+            time_from = time_to - timedelta(days=window_days)
+            logger.info(f"   Period: {time_from.date()} to {time_to.date()}")
+            try:
                 report_id = await service.request_historical_report(
-                    time_from_str, time_to_str
+                    _fmt(time_from), time_to_str
                 )
-            else:
+                logger.info(f"   ✓ Report {report_id} requested successfully")
+                break
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    logger.error("   ❌ Rate limited - too many recent requests")
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Rate limited. Trading 212 allows 1 report request per 30-60 seconds. Please wait and try again.",
+                    )
+                is_last_window = index == len(candidate_windows) - 1
+                if e.response.status_code == 400 and not is_last_window:
+                    logger.warning(
+                        f"   ⚠️ {window_days} day report rejected, trying a shorter window..."
+                    )
+                    continue
                 raise
 
         # Step 3: Wait for report to generate and download
@@ -333,6 +506,7 @@ async def sync_trading212(
 
         # Step 4: Parse CSV
         logger.info("📊 Parsing CSV...")
+        _progress("Parsing report...")
         with open(csv_filepath, "r") as f:
             csv_content = f.read()
 
@@ -341,6 +515,7 @@ async def sync_trading212(
 
         # Step 4: Import transactions with deduplication
         logger.info("💾 Importing transactions...")
+        _progress("Importing transactions...")
         new_transactions = 0
         skipped_duplicates = 0
 
@@ -460,6 +635,7 @@ async def sync_trading212(
 
         # Step 5: Update holdings from transactions
         logger.info("📈 Recalculating holdings from transactions...")
+        _progress("Recalculating holdings...")
 
         # Get or create Trading212 account
         account = (
@@ -479,45 +655,55 @@ async def sync_trading212(
             db.add(account)
             db.flush()
 
-        # Calculate holdings from all transactions
-        from collections import defaultdict
-        from decimal import Decimal
-
-        holdings_data = defaultdict(
-            lambda: {"shares": Decimal("0"), "total_cost": Decimal("0")}
-        )
-
-        # Get all buy/sell transactions for this user
-        buy_sell_transactions = (
+        # Every action that moves a share count has to be replayed here. Splits in
+        # particular arrive as a close (old share count) plus an open (new share
+        # count) at the same timestamp; ignoring them leaves the position stuck at
+        # the pre-split quantity.
+        position_transactions = (
             db.query(Transaction)
             .filter(
                 Transaction.user_id == current_user.id,
                 Transaction.broker_name == "Trading212",
-                Transaction.action_type.in_(
-                    [TransactionType.BUY, TransactionType.SELL]
-                ),
+                Transaction.action_type.in_(POSITION_ACTIONS),
             )
             .order_by(Transaction.timestamp)
             .all()
         )
 
-        for tx in buy_sell_transactions:
-            if not tx.security_id:
-                continue
+        holdings_data, unresolved_positions = replay_positions(position_transactions)
 
-            if tx.action_type == TransactionType.BUY:
-                holdings_data[tx.security_id]["shares"] += tx.shares or Decimal("0")
-                holdings_data[tx.security_id]["total_cost"] += (
-                    tx.total_amount or Decimal("0")
-                )
-            elif tx.action_type == TransactionType.SELL:
-                holdings_data[tx.security_id]["shares"] -= tx.shares or Decimal("0")
-                # Calculate realized P/L (optional, can add later)
+        if unresolved_positions:
+            logger.warning(
+                f"   ⚠️ {unresolved_positions} position transactions have no matched "
+                "security and are excluded from holdings"
+            )
+
+        # Drop holdings whose transactions no longer add up to a position
+        stale_holdings = (
+            db.query(Holding)
+            .filter(
+                Holding.account_id == account.id,
+                Holding.security_id.notin_(list(holdings_data.keys())),
+            )
+            .delete(synchronize_session=False)
+            if holdings_data
+            else 0
+        )
+        if stale_holdings:
+            logger.info(f"   Removed {stale_holdings} stale holdings")
 
         # Update or create holdings
+        incomplete_history = 0
         for security_id, data in holdings_data.items():
-            if data["shares"] <= 0:
-                # Remove holding if sold all shares
+            if data["shares"] < 0:
+                # A negative share count is impossible in reality - it means the
+                # opening buys fall outside the exported history window. Leave any
+                # existing holding untouched rather than deleting a real position.
+                incomplete_history += 1
+                continue
+
+            if data["shares"] == 0:
+                # Genuinely closed out
                 db.query(Holding).filter(
                     Holding.account_id == account.id, Holding.security_id == security_id
                 ).delete()
@@ -531,11 +717,10 @@ async def sync_trading212(
                 .first()
             )
 
-            avg_cost = (
-                data["total_cost"] / data["shares"]
-                if data["shares"] > 0
-                else Decimal("0")
-            )
+            # Rounding on proportional sell write-downs can push the basis a
+            # fraction below zero; clamp so avg_cost never goes negative.
+            remaining_cost = max(data["total_cost"], Decimal("0"))
+            avg_cost = remaining_cost / data["shares"]
 
             if holding:
                 holding.quantity = float(data["shares"])
@@ -553,9 +738,15 @@ async def sync_trading212(
 
         db.commit()
         logger.info(f"✓ Updated holdings for {len(holdings_data)} securities")
+        if incomplete_history:
+            logger.warning(
+                f"   ⚠️ {incomplete_history} positions have buys older than the exported "
+                "history window; their holdings were left unchanged"
+            )
 
         # Step 6: Update dividends from DIVIDEND transactions
         logger.info("💰 Processing dividend transactions...")
+        _progress("Processing dividends...")
 
         dividend_transactions = (
             db.query(Transaction)
@@ -601,25 +792,32 @@ async def sync_trading212(
         db.commit()
         logger.info(f"✓ Added {dividends_added} dividend records")
 
-        # Step 7: Update sync timestamp
-        current_user.last_t212_sync_timestamp = datetime.now()
-        current_user.t212_sync_time_from = (
-            time_from
-            if isinstance(time_from, datetime)
-            else datetime.fromisoformat(time_from.replace("Z", ""))
-        )
-        current_user.t212_sync_time_to = (
-            time_to if isinstance(time_to, datetime) else datetime.now()
-        )
-        db.commit()
-        logger.info("✓ Sync timestamp updated")
+        # Step 7: Update sync watermark.
+        # Only advance it when the report actually yielded rows. A report that
+        # parsed to nothing means the export did not really cover the window, and
+        # moving the watermark forward would skip that period permanently - the
+        # next delta sync starts after it and those events are never fetched again.
+        if all_parsed_transactions:
+            current_user.last_t212_sync_timestamp = time_to
+            current_user.t212_sync_time_from = time_from
+            current_user.t212_sync_time_to = time_to
+            db.commit()
+            logger.info("✓ Sync timestamp updated")
+        else:
+            logger.warning(
+                "⚠️ Report contained no transactions - leaving the sync watermark "
+                "untouched so this period is retried on the next sync"
+            )
 
         # Build detailed status message
         status_message = f"Successfully synced {new_transactions} new transactions"
         if skipped_duplicates > 0:
             status_message += f" ({skipped_duplicates} duplicates skipped)"
-        if len(all_parsed_transactions) == 0:
-            status_message = "Sync completed but no transactions found (possibly rate limited or empty period)"
+        if not all_parsed_transactions:
+            status_message = (
+                "Trading 212 returned an empty report for this period. "
+                "Nothing was imported and the next sync will retry the same window."
+            )
 
         logger.info("=" * 60)
         logger.info(f"✅ {status_message}")
@@ -637,6 +835,7 @@ async def sync_trading212(
             "dividends_updated": dividends_added,
             "transactions_imported": new_transactions,
             "transactions_skipped": skipped_duplicates,
+            "unresolved_transactions": unresolved_positions,
         }
 
     except httpx.HTTPStatusError as e:

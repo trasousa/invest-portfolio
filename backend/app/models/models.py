@@ -392,13 +392,15 @@ class Transaction(Base):
         Index("idx_user_broker_external", "user_id", "broker_name", "external_id"),
         Index("idx_user_timestamp", "user_id", "timestamp"),
         Index("idx_security_timestamp", "security_id", "timestamp"),
+        # Deduplicate on the broker's own identifier. A previous index keyed on
+        # (ticker, timestamp, total_amount) could not tell a stock split's close
+        # row from its open row - they share all three - so importing any split
+        # failed with an IntegrityError.
         Index(
-            "uq_user_symbol_time_amount",
+            "uq_user_broker_external_id",
             "user_id",
             "broker_name",
-            "ticker",
-            "timestamp",
-            "total_amount",
+            "external_id",
             unique=True,
         ),
     )
